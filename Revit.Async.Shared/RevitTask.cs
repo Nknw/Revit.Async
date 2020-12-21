@@ -9,6 +9,7 @@ using Revit.Async.Extensions;
 using Revit.Async.ExternalEvents;
 using Revit.Async.Interfaces;
 using Revit.Async.Utils;
+using Autodesk.Revit.DB;
 
 #endregion
 
@@ -17,43 +18,16 @@ namespace Revit.Async
     /// <summary>
     ///     Provide some useful methods to support running Revit API code from any context
     /// </summary>
-    public class RevitTask : IRevitTask
+    public class RevitTask
     {
         #region Fields
-
-        private static ConcurrentDictionary<Type, ExternalEventPair> _asyncDelegateExternalEvents;
-        private static ConcurrentDictionary<Type, ExternalEventPair> _syncDelegateExternalEvents;
-        private static ConcurrentDictionary<Type, ExternalEventPair> _registeredExternalEvents;
         private        ConcurrentDictionary<Type, ExternalEventPair> _scopedRegisteredExternalEvents;
 
         #endregion
 
         #region Properties
 
-        /// <summary>
-        ///     Cache all the created <see cref="ExternalEvent" />s and their <see cref="IExternalEventHandler" /> running async
-        ///     code
-        /// </summary>
-        private static ConcurrentDictionary<Type, ExternalEventPair> AsyncDelegateExternalEvents =>
-            _asyncDelegateExternalEvents ?? (_asyncDelegateExternalEvents = new ConcurrentDictionary<Type, ExternalEventPair>());
-
-        /// <summary>
-        ///     Use to create any other external events
-        /// </summary>
-        private static ExternalEventPair ExternalEventCreator { get; set; }
-
-        /// <summary>
-        ///     Store the external events registered globally
-        /// </summary>
-        private static ConcurrentDictionary<Type, ExternalEventPair> RegisteredExternalEvents =>
-            _registeredExternalEvents ?? (_registeredExternalEvents = new ConcurrentDictionary<Type, ExternalEventPair>());
-
-        /// <summary>
-        ///     Cache all the created <see cref="ExternalEvent" />s and their <see cref="IExternalEventHandler" /> running sync
-        ///     code
-        /// </summary>
-        private static ConcurrentDictionary<Type, ExternalEventPair> SyncDelegateExternalEvents =>
-            _syncDelegateExternalEvents ?? (_syncDelegateExternalEvents = new ConcurrentDictionary<Type, ExternalEventPair>());
+        private static IRevitTaskBehavior revitTaskBehavior;
 
         /// <summary>
         ///     Store the external events registered in current scope
@@ -63,47 +37,15 @@ namespace Revit.Async
 
         #endregion
 
-        #region Interface Implementations
-
-        /// <inheritdoc />
-        public void Dispose()
-        {
-            _scopedRegisteredExternalEvents.Clear();
-            _scopedRegisteredExternalEvents = null;
-        }
-
-        /// <inheritdoc />
-        public Task<TResult> Raise<THandler, TParameter, TResult>(TParameter parameter)
-            where THandler : IGenericExternalEventHandler<TParameter, TResult>
-        {
-            if (ScopedRegisteredExternalEvents.TryGetValue(typeof(THandler), out var pair))
-            {
-                return pair.RunAsync<TParameter, TResult>(parameter);
-            }
-
-            return TaskUtils.FromResult(default(TResult));
-        }
-
-        /// <inheritdoc />
-        public void Register<TParameter, TResult>(IGenericExternalEventHandler<TParameter, TResult> handler)
-        {
-            ScopedRegisteredExternalEvents.TryAdd(handler.GetType(), new ExternalEventPair(handler, () => CreateExternalEvent(handler)));
-        }
-
-        #endregion
-
         #region Others
 
         /// <summary>
         ///     Always call this method ahead of time in Revit API context to make sure that <see cref="RevitTask" /> functions
         ///     properly
         /// </summary>
-        public static void Initialize()
+        public static void Initialize(IRevitTaskBehavior behavior = null)
         {
-            if (ExternalEventCreator == null)
-            {
-                ExternalEventCreator = new ExternalEventPair(new SyncDelegateExternalEventHandler<ExternalEvent>());
-            }
+            revitTaskBehavior = behavior ?? new DefaultRevitTaskBehavior();
         }
 
         /// <summary>
@@ -126,12 +68,7 @@ namespace Revit.Async
         public static Task<TResult> RaiseGlobal<THandler, TParameter, TResult>(TParameter parameter)
             where THandler : IGenericExternalEventHandler<TParameter, TResult>
         {
-            if (RegisteredExternalEvents.TryGetValue(typeof(THandler), out var pair))
-            {
-                return pair.RunAsync<TParameter, TResult>(parameter);
-            }
-
-            return TaskUtils.FromResult(default(TResult));
+            return revitTaskBehavior.RaiseGlobal<THandler, TParameter, TResult>(parameter);
         }
 
         /// <summary>
@@ -149,7 +86,7 @@ namespace Revit.Async
         /// <param name="handler">The instance of <see cref="IGenericExternalEventHandler{TParameter,TResult}" /></param>
         public static void RegisterGlobal<TParameter, TResult>(IGenericExternalEventHandler<TParameter, TResult> handler)
         {
-            RegisteredExternalEvents.TryAdd(handler.GetType(), new ExternalEventPair(handler));
+            revitTaskBehavior.RegisterGlobal(handler);
         }
 
         /// <summary>
@@ -171,12 +108,7 @@ namespace Revit.Async
         /// <returns>The result</returns>
         public static Task<TResult> RunAsync<TResult>(Func<UIApplication, TResult> function)
         {
-            var externalEventPair = SyncDelegateExternalEvents.GetOrAdd(typeof(TResult), _ =>
-            {
-                var handler = new SyncDelegateExternalEventHandler<TResult>();
-                return new ExternalEventPair(handler, () => CreateExternalEvent(handler));
-            });
-            return externalEventPair.RunAsync<Func<UIApplication, TResult>, TResult>(function);
+            return revitTaskBehavior.RunAsync(function);
         }
 
         /// <summary>
@@ -204,12 +136,7 @@ namespace Revit.Async
         /// <returns></returns>
         public static Task<TResult> RunAsync<TResult>(Func<UIApplication, Task<TResult>> function)
         {
-            var externalEventPair = AsyncDelegateExternalEvents.GetOrAdd(typeof(TResult), _ =>
-            {
-                var handler = new AsyncDelegateExternalEventHandler<TResult>();
-                return new ExternalEventPair(handler, () => CreateExternalEvent(handler));
-            });
-            return externalEventPair.RunAsync<Func<UIApplication, Task<TResult>>, TResult>(function);
+            return revitTaskBehavior.RunAsync(function);
         }
 
         /// <summary>
@@ -259,15 +186,23 @@ namespace Revit.Async
             return RunAsync(app => function(app).ContinueWith(task => (object) null));
         }
 
-        /// <summary>
-        ///     Create a new <see cref="ExternalEvent" /> for an <see cref="IExternalEventHandler" /> instance
-        /// </summary>
-        /// <param name="handler">The <see cref="IExternalEventHandler" /> instance</param>
-        /// <returns>The <see cref="ExternalEvent" /> created</returns>
-        private static Task<ExternalEvent> CreateExternalEvent(IExternalEventHandler handler)
-        {
-            return ExternalEventCreator.RunAsync<Func<UIApplication, ExternalEvent>, ExternalEvent>(app => ExternalEvent.Create(handler));
-        }
+        public static Task<TResult> RunFromUIDoc<TResult>(Func<UIDocument, TResult> function)
+            => RunAsync(app => function(app.ActiveUIDocument));
+
+        public static Task RunFromUIDoc(Action<UIDocument> function)
+            => RunAsync(app => function(app.ActiveUIDocument));
+
+        public static Task<TResult> RunFromUIDoc<TResult>(Func<UIDocument, Task<TResult>> function)
+            => RunAsync(app => function(app.ActiveUIDocument));
+
+        public static Task<TResult> RunFromDoc<TResult>(Func<Document, TResult> function)
+            => RunAsync(app => function(app.ActiveUIDocument.Document));
+
+        public static Task RunFromDoc(Action<Document> function)
+            => RunAsync(app => function(app.ActiveUIDocument.Document));
+
+        public static Task<TResult> RunFromDoc<TResult>(Func<Document, Task<TResult>> function)
+            => RunAsync(app => function(app.ActiveUIDocument.Document));
 
         #endregion
     }
